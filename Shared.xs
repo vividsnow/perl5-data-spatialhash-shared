@@ -10,6 +10,7 @@
         croak("Expected a Data::SpatialHash::Shared object"); \
     SpatialHandle *h = INT2PTR(SpatialHandle*, SvIV(SvRV(sv))); \
     if (!h) croak("Attempted to use a destroyed Data::SpatialHash::Shared object"); \
+    SpatialHandle *h0 = h; PERL_UNUSED_VAR(h0); \
     sv_2mortal(SvREFCNT_inc(SvRV(sv)))
 
 /* Re-read the handle after a call that can run Perl code (tied/overloaded
@@ -20,7 +21,7 @@
  * can actually intervene between EXTRACT and the first use of h. */
 #define REEXTRACT(sv) \
     h = INT2PTR(SpatialHandle*, SvIV(SvRV(sv))); \
-    if (!h) croak("Data::SpatialHash::Shared object destroyed during the call")
+    if (h != h0) croak("Data::SpatialHash::Shared object replaced or destroyed during the call")
 
 #define MAKE_OBJ(class, handle) \
     SV *obj = newSViv(PTR2IV(handle)); \
@@ -92,6 +93,7 @@ static const double *sph_parse_opts(pTHX_ SV **sp, int first, int items, double 
             if (!SvROK(wv) || SvTYPE(SvRV(wv)) != SVt_PVAV)
                 croak("%s: wrap must be an arrayref [Wx, Wy] or [Wx, Wy, Wz]", who);
             AV *av = (AV *)SvRV(wv);
+            sv_2mortal(SvREFCNT_inc((SV *)av));   /* pin the arrayref: element magic below cannot free it mid-loop */
             SSize_t n = av_len(av) + 1;
             if (n < 2 || n > 3) croak("%s: wrap needs 2 or 3 extents", who);
             world[0] = world[1] = world[2] = 0.0;
@@ -489,6 +491,7 @@ move_many(self, rows)
         croak("move_many: expected an arrayref of [handle,x,y] or [handle,x,y,z]");
     {
     AV *av = (AV *)SvRV(rows);
+    sv_2mortal(SvREFCNT_inc((SV *)av));   /* pin the arrayref: element magic below cannot free it mid-loop */
     SSize_t nr = av_len(av) + 1;
     struct mm_row { uint32_t handle; double x, y, z; int valid; } *R = NULL;
     moved = 0;
@@ -538,6 +541,7 @@ insert_many(self, rows)
         croak("insert_many: expected an arrayref of [x,y,value] or [x,y,value,radius]");
     {
     AV *av = (AV *)SvRV(rows);
+    sv_2mortal(SvREFCNT_inc((SV *)av));   /* pin the arrayref: element magic below cannot free it mid-loop */
     SSize_t nr = av_len(av) + 1;
     struct im_row { double x, y, rad; int64_t val; int valid; } *R = NULL;
     uint32_t *ids = NULL;
@@ -667,6 +671,7 @@ query_radius_many(self, queries)
         croak("query_radius_many: expected an arrayref of [x,y,r] or [x,y,z,r]");
     {
     AV *qav = (AV *)SvRV(queries);
+    sv_2mortal(SvREFCNT_inc((SV *)qav));   /* pin the arrayref: element magic below cannot free it mid-loop */
     SSize_t nq = av_len(qav) + 1;
     AV *out = newAV();
     if (nq > 0) av_extend(out, nq - 1);
