@@ -42,6 +42,12 @@
         croak("invalid or freed handle %u", (unsigned)(idx)); } \
 } while (0)
 
+/* frozen-read-only-view counterpart of REQUIRE_LIVE (no lock was taken, so none to release) */
+#define REQUIRE_LIVE_RO(h, idx) do { \
+    if (!sph_is_live((h), (idx))) \
+        croak("invalid or freed handle %u", (unsigned)(idx)); \
+} while (0)
+
 /* Shared croak message for the SPH_Q_TOOBIG cap (EMIT_QUERY, EMIT_PAIRS, each_in_radius, query_radius_many);
    takes (unsigned)SPH_MAX_QUERY_CELLS as its %u argument. */
 #define SPH_TOOBIG_MSG "query region spans more than %u cells; increase cell_size or shrink the query"
@@ -50,9 +56,9 @@
    mortal IVs. `CALL` must be an expression filling sph_collect_t `col`. */
 #define EMIT_QUERY(CALL) do { \
     sph_collect_t col = { NULL, 0, 0 }; \
-    sph_rwlock_rdlock(h); \
-    int rc = (CALL); \
-    sph_rwlock_rdunlock(h); \
+    int rc; \
+    if (h->readonly) { rc = (CALL); }                                              /* frozen: immutable, no lock */ \
+    else { sph_rwlock_rdlock(h); rc = (CALL); sph_rwlock_rdunlock(h); } \
     if (rc == SPH_Q_OOM)    { free(col.vals); croak("query: out of memory"); } \
     if (rc == SPH_Q_TOOBIG) { free(col.vals); croak(SPH_TOOBIG_MSG, (unsigned)SPH_MAX_QUERY_CELLS); } \
     EXTEND(SP, (SSize_t)col.n); \
@@ -65,9 +71,9 @@
    still frees the buffer; re-throw after cleanup (matches each_in_radius). */
 #define EMIT_PAIRS(CALL) do { \
     sph_collect_t col = { NULL, 0, 0 }; \
-    sph_rwlock_rdlock(h); \
-    int rc = (CALL); \
-    sph_rwlock_rdunlock(h); \
+    int rc; \
+    if (h->readonly) { rc = (CALL); }                                              /* frozen: immutable, no lock */ \
+    else { sph_rwlock_rdlock(h); rc = (CALL); sph_rwlock_rdunlock(h); } \
     if (rc == SPH_Q_OOM)    { free(col.vals); croak("each pair: out of memory"); } \
     if (rc == SPH_Q_TOOBIG) { free(col.vals); croak(SPH_TOOBIG_MSG, (unsigned)SPH_MAX_QUERY_CELLS); } \
     for (size_t i = 0; i + 1 < col.n; i += 2) { \
@@ -180,6 +186,24 @@ new_from_fd(class, fd)
   OUTPUT:
     RETVAL
 
+SV *
+new_readonly(class, path)
+    const char *class
+    SV *path
+  PREINIT:
+    char errbuf[SPH_ERR_BUFLEN];
+  CODE:
+    /* Open a FROZEN (sealed) file read-only: O_RDONLY + PROT_READ, lock-free.
+       Requires ->freeze on the producer; a non-frozen file is refused. */
+    const char *p = (SvGETMAGIC(path), SvOK(path)) ? SvPV_nolen(path) : NULL;
+    if (!p) croak("Data::SpatialHash::Shared->new_readonly: path is required");
+    SpatialHandle *h = sph_open_readonly(p, errbuf);
+    if (!h) croak("Data::SpatialHash::Shared->new_readonly: %s", errbuf);
+    class = SvPV_nolen(ST(0));   /* re-read: SvGETMAGIC(path) above can run Perl that reallocs/frees ST(0)'s PV */
+    MAKE_OBJ(class, h);
+  OUTPUT:
+    RETVAL
+
 void
 DESTROY(self)
     SV *self
@@ -196,7 +220,7 @@ sync(self)
   PREINIT:
     EXTRACT(self);
   CODE:
-    if (sph_msync(h) != 0) croak("msync: %s", strerror(errno));
+    if (!h->readonly && sph_msync(h) != 0) croak("msync: %s", strerror(errno));
 
 void
 unlink(self_or_class, ...)
@@ -359,6 +383,7 @@ insert(self, x, y, ...)
     int64_t val;
     uint32_t idx;
   CODE:
+    if (h->readonly) croak("Data::SpatialHash::Shared->insert: spatial hash is frozen (read-only)");
     /* (x,y,value)=4 2D ; (x,y,z,value)=5 3D ; (x,y,z,value,radius)=6 3D+radius */
     z = 0; radius = 0;
     if (items == 4) { val = (int64_t)SvIV(ST(3)); }
@@ -368,6 +393,7 @@ insert(self, x, y, ...)
     if (radius < 0 || !isfinite(radius)) croak("insert: radius must be a finite number >= 0");
     REEXTRACT(self);
     sph_rwlock_wrlock(h);
+    if (h->hdr->sealed) { sph_rwlock_wrunlock(h); croak("Data::SpatialHash::Shared->insert: spatial hash is frozen (read-only)"); }
     idx = sph_insert_locked(h, x, y, z, val, radius);
     __atomic_fetch_add(&h->hdr->stat_ops, 1, __ATOMIC_RELAXED);
     sph_rwlock_wrunlock(h);
@@ -385,11 +411,13 @@ move(self, handle, x, y, ...)
     EXTRACT(self);
     double z;
   CODE:
+    if (h->readonly) croak("Data::SpatialHash::Shared->move: spatial hash is frozen (read-only)");
     z = 0;
     if (items == 5) z = (double)SvNV(ST(4));
     else if (items != 4) croak("move: expected (handle,x,y) or (handle,x,y,z)");
     REEXTRACT(self);
     sph_rwlock_wrlock(h);
+    if (h->hdr->sealed) { sph_rwlock_wrunlock(h); croak("Data::SpatialHash::Shared->move: spatial hash is frozen (read-only)"); }
     RETVAL = sph_move_locked(h, sph_idx(handle), x, y, z);
     __atomic_fetch_add(&h->hdr->stat_ops, 1, __ATOMIC_RELAXED);
     sph_rwlock_wrunlock(h);
@@ -403,7 +431,9 @@ remove(self, handle)
   PREINIT:
     EXTRACT(self);
   CODE:
+    if (h->readonly) croak("Data::SpatialHash::Shared->remove: spatial hash is frozen (read-only)");
     sph_rwlock_wrlock(h);
+    if (h->hdr->sealed) { sph_rwlock_wrunlock(h); croak("Data::SpatialHash::Shared->remove: spatial hash is frozen (read-only)"); }
     RETVAL = sph_remove_locked(h, sph_idx(handle));
     __atomic_fetch_add(&h->hdr->stat_ops, 1, __ATOMIC_RELAXED);
     sph_rwlock_wrunlock(h);
@@ -417,9 +447,13 @@ has(self, handle)
   PREINIT:
     EXTRACT(self);
   CODE:
-    sph_rwlock_rdlock(h);
-    RETVAL = sph_is_live(h, sph_idx(handle));
-    sph_rwlock_rdunlock(h);
+    if (h->readonly) {
+        RETVAL = sph_is_live(h, sph_idx(handle));
+    } else {
+        sph_rwlock_rdlock(h);
+        RETVAL = sph_is_live(h, sph_idx(handle));
+        sph_rwlock_rdunlock(h);
+    }
   OUTPUT:
     RETVAL
 
@@ -430,10 +464,15 @@ value(self, handle)
   PREINIT:
     EXTRACT(self);
   CODE:
-    sph_rwlock_rdlock(h);
-    REQUIRE_LIVE_RD(h, sph_idx(handle));
-    RETVAL = (IV)h->entries[sph_idx(handle)].value;
-    sph_rwlock_rdunlock(h);
+    if (h->readonly) {
+        REQUIRE_LIVE_RO(h, sph_idx(handle));
+        RETVAL = (IV)h->entries[sph_idx(handle)].value;
+    } else {
+        sph_rwlock_rdlock(h);
+        REQUIRE_LIVE_RD(h, sph_idx(handle));
+        RETVAL = (IV)h->entries[sph_idx(handle)].value;
+        sph_rwlock_rdunlock(h);
+    }
   OUTPUT:
     RETVAL
 
@@ -445,7 +484,9 @@ set_value(self, handle, v)
   PREINIT:
     EXTRACT(self);
   CODE:
+    if (h->readonly) croak("Data::SpatialHash::Shared->set_value: spatial hash is frozen (read-only)");
     sph_rwlock_wrlock(h);
+    if (h->hdr->sealed) { sph_rwlock_wrunlock(h); croak("Data::SpatialHash::Shared->set_value: spatial hash is frozen (read-only)"); }
     REQUIRE_LIVE(h, sph_idx(handle));
     h->entries[sph_idx(handle)].value = (int64_t)v;
     __atomic_fetch_add(&h->hdr->stat_ops, 1, __ATOMIC_RELAXED);
@@ -459,8 +500,10 @@ set_radius(self, handle, radius)
   PREINIT:
     EXTRACT(self);
   CODE:
+    if (h->readonly) croak("Data::SpatialHash::Shared->set_radius: spatial hash is frozen (read-only)");
     if (radius < 0 || !isfinite(radius)) croak("set_radius: radius must be a finite number >= 0");
     sph_rwlock_wrlock(h);
+    if (h->hdr->sealed) { sph_rwlock_wrunlock(h); croak("Data::SpatialHash::Shared->set_radius: spatial hash is frozen (read-only)"); }
     REQUIRE_LIVE(h, sph_idx(handle));
     h->entries[sph_idx(handle)].radius = (double)radius;
     __atomic_fetch_add(&h->hdr->stat_ops, 1, __ATOMIC_RELAXED);
@@ -473,10 +516,15 @@ get_radius(self, handle)
   PREINIT:
     EXTRACT(self);
   CODE:
-    sph_rwlock_rdlock(h);
-    REQUIRE_LIVE_RD(h, sph_idx(handle));
-    RETVAL = h->entries[sph_idx(handle)].radius;
-    sph_rwlock_rdunlock(h);
+    if (h->readonly) {
+        REQUIRE_LIVE_RO(h, sph_idx(handle));
+        RETVAL = h->entries[sph_idx(handle)].radius;
+    } else {
+        sph_rwlock_rdlock(h);
+        REQUIRE_LIVE_RD(h, sph_idx(handle));
+        RETVAL = h->entries[sph_idx(handle)].radius;
+        sph_rwlock_rdunlock(h);
+    }
   OUTPUT:
     RETVAL
 
@@ -488,6 +536,7 @@ move_many(self, rows)
     EXTRACT(self);
     IV moved;
   CODE:
+    if (h->readonly) croak("Data::SpatialHash::Shared->move_many: spatial hash is frozen (read-only)");
     SvGETMAGIC(rows);
     if (!SvROK(rows) || SvTYPE(SvRV(rows)) != SVt_PVAV)
         croak("move_many: expected an arrayref of [handle,x,y] or [handle,x,y,z]");
@@ -520,6 +569,7 @@ move_many(self, rows)
     /* Phase 2: pure C under the write lock, using pre-resolved values only. */
     REEXTRACT(self);
     sph_rwlock_wrlock(h);
+    if (h->hdr->sealed) { sph_rwlock_wrunlock(h); croak("Data::SpatialHash::Shared->move_many: spatial hash is frozen (read-only)"); }
     for (SSize_t i = 0; i < nr; i++) {
         if (!R[i].valid) continue;
         if (sph_move_locked(h, R[i].handle, R[i].x, R[i].y, R[i].z)) moved++;
@@ -538,6 +588,7 @@ insert_many(self, rows)
   PREINIT:
     EXTRACT(self);
   PPCODE:
+    if (h->readonly) croak("Data::SpatialHash::Shared->insert_many: spatial hash is frozen (read-only)");
     SvGETMAGIC(rows);
     if (!SvROK(rows) || SvTYPE(SvRV(rows)) != SVt_PVAV)
         croak("insert_many: expected an arrayref of [x,y,value] or [x,y,value,radius]");
@@ -582,6 +633,7 @@ insert_many(self, rows)
     /* Phase 2: pure C under the write lock into a C result buffer. */
     REEXTRACT(self);
     sph_rwlock_wrlock(h);
+    if (h->hdr->sealed) { sph_rwlock_wrunlock(h); croak("Data::SpatialHash::Shared->insert_many: spatial hash is frozen (read-only)"); }
     for (SSize_t i = 0; i < nr; i++)
         ids[i] = R[i].valid
             ? sph_insert_locked(h, R[i].x, R[i].y, 0.0, R[i].val, R[i].rad)
@@ -601,12 +653,19 @@ position(self, handle)
     EXTRACT(self);
     double px, py, pz;
   PPCODE:
-    sph_rwlock_rdlock(h);
-    REQUIRE_LIVE_RD(h, sph_idx(handle));
-    px = h->entries[sph_idx(handle)].pos[0];
-    py = h->entries[sph_idx(handle)].pos[1];
-    pz = h->entries[sph_idx(handle)].pos[2];
-    sph_rwlock_rdunlock(h);
+    if (h->readonly) {
+        REQUIRE_LIVE_RO(h, sph_idx(handle));
+        px = h->entries[sph_idx(handle)].pos[0];
+        py = h->entries[sph_idx(handle)].pos[1];
+        pz = h->entries[sph_idx(handle)].pos[2];
+    } else {
+        sph_rwlock_rdlock(h);
+        REQUIRE_LIVE_RD(h, sph_idx(handle));
+        px = h->entries[sph_idx(handle)].pos[0];
+        py = h->entries[sph_idx(handle)].pos[1];
+        pz = h->entries[sph_idx(handle)].pos[2];
+        sph_rwlock_rdunlock(h);
+    }
     EXTEND(SP, 3);
     PUSHs(sv_2mortal(newSVnv(px)));
     PUSHs(sv_2mortal(newSVnv(py)));
@@ -712,7 +771,7 @@ query_radius_many(self, queries)
     sph_collect_t *R = NULL;
     if (nq > 0) { Newxz(R, nq, sph_collect_t); SAVEFREEPV(R); }
     REEXTRACT(self);
-    sph_rwlock_rdlock(h);                          /* one lock for the whole batch */
+    if (!h->readonly) sph_rwlock_rdlock(h);        /* one lock for the whole batch (frozen: immutable, no lock) */
     for (SSize_t i = 0; i < nq && !err; i++) {
         if (Q[i].dims) {
             sph_collect_t col = { NULL, 0, 0 };
@@ -722,7 +781,7 @@ query_radius_many(self, queries)
             else R[i] = col;                       /* transfer ownership of col.vals */
         }
     }
-    sph_rwlock_rdunlock(h);
+    if (!h->readonly) sph_rwlock_rdunlock(h);
     if (err) {
         for (SSize_t i = 0; i < nq; i++) free(R[i].vals);   /* free what Phase 2 collected */
         SvREFCNT_dec((SV *)out);
@@ -756,9 +815,11 @@ insert_geo(self, lat, lon, alt, value)
     double xyz[3];
     uint32_t idx;
   CODE:
+    if (h->readonly) croak("Data::SpatialHash::Shared->insert_geo: spatial hash is frozen (read-only)");
     if (!(h->hdr->sphere_radius > 0.0)) croak("insert_geo: map was not created with sphere => R");
     sph_geo_to_xyz(h->hdr->sphere_radius, lat, lon, alt, xyz);
     sph_rwlock_wrlock(h);
+    if (h->hdr->sealed) { sph_rwlock_wrunlock(h); croak("Data::SpatialHash::Shared->insert_geo: spatial hash is frozen (read-only)"); }
     idx = sph_insert_locked(h, xyz[0], xyz[1], xyz[2], (int64_t)value, 0.0);
     __atomic_fetch_add(&h->hdr->stat_ops, 1, __ATOMIC_RELAXED);
     sph_rwlock_wrunlock(h);
@@ -777,9 +838,11 @@ move_geo(self, handle, lat, lon, alt)
     EXTRACT(self);
     double xyz[3];
   CODE:
+    if (h->readonly) croak("Data::SpatialHash::Shared->move_geo: spatial hash is frozen (read-only)");
     if (!(h->hdr->sphere_radius > 0.0)) croak("move_geo: map was not created with sphere => R");
     sph_geo_to_xyz(h->hdr->sphere_radius, lat, lon, alt, xyz);
     sph_rwlock_wrlock(h);
+    if (h->hdr->sealed) { sph_rwlock_wrunlock(h); croak("Data::SpatialHash::Shared->move_geo: spatial hash is frozen (read-only)"); }
     RETVAL = sph_move_locked(h, sph_idx(handle), xyz[0], xyz[1], xyz[2]);
     __atomic_fetch_add(&h->hdr->stat_ops, 1, __ATOMIC_RELAXED);
     sph_rwlock_wrunlock(h);
@@ -795,12 +858,19 @@ position_geo(self, handle)
     double p[3], lat, lon, alt;
   PPCODE:
     if (!(h->hdr->sphere_radius > 0.0)) croak("position_geo: map was not created with sphere => R");
-    sph_rwlock_rdlock(h);
-    REQUIRE_LIVE_RD(h, sph_idx(handle));
-    p[0] = h->entries[sph_idx(handle)].pos[0];
-    p[1] = h->entries[sph_idx(handle)].pos[1];
-    p[2] = h->entries[sph_idx(handle)].pos[2];
-    sph_rwlock_rdunlock(h);
+    if (h->readonly) {
+        REQUIRE_LIVE_RO(h, sph_idx(handle));
+        p[0] = h->entries[sph_idx(handle)].pos[0];
+        p[1] = h->entries[sph_idx(handle)].pos[1];
+        p[2] = h->entries[sph_idx(handle)].pos[2];
+    } else {
+        sph_rwlock_rdlock(h);
+        REQUIRE_LIVE_RD(h, sph_idx(handle));
+        p[0] = h->entries[sph_idx(handle)].pos[0];
+        p[1] = h->entries[sph_idx(handle)].pos[1];
+        p[2] = h->entries[sph_idx(handle)].pos[2];
+        sph_rwlock_rdunlock(h);
+    }
     sph_geo_of_xyz(h->hdr->sphere_radius, p, &lat, &lon, &alt);
     EXTEND(SP, 3);
     PUSHs(sv_2mortal(newSVnv(lat)));
@@ -973,12 +1043,12 @@ void each_in_radius(self, ...)
     SvGETMAGIC(cb);   /* a tied/overloaded scalar may FETCH to a coderef */
     if (!SvROK(cb) || SvTYPE(SvRV(cb)) != SVt_PVCV) croak("each_in_radius: last arg must be a coderef");
     if (r < 0 || !isfinite(r)) croak("each_in_radius: r must be a finite number >= 0");
-    /* snapshot under lock */
+    /* snapshot under lock (frozen: immutable, no lock) */
     sph_collect_t col = { NULL, 0, 0 };
     REEXTRACT(self);
-    sph_rwlock_rdlock(h);
-    int rc = sph_query_radius(h, c, r, dims, &col);
-    sph_rwlock_rdunlock(h);
+    int rc;
+    if (h->readonly) { rc = sph_query_radius(h, c, r, dims, &col); }
+    else { sph_rwlock_rdlock(h); rc = sph_query_radius(h, c, r, dims, &col); sph_rwlock_rdunlock(h); }
     if (rc == SPH_Q_OOM)    { free(col.vals); croak("each_in_radius: out of memory"); }
     if (rc == SPH_Q_TOOBIG) { free(col.vals); croak(SPH_TOOBIG_MSG, (unsigned)SPH_MAX_QUERY_CELLS); }
     /* invoke callback per value AFTER releasing the lock; G_EVAL so a die in
@@ -1024,20 +1094,58 @@ void clear(self)
   PREINIT:
     EXTRACT(self);
   CODE:
+    if (h->readonly) croak("Data::SpatialHash::Shared->clear: spatial hash is frozen (read-only)");
     sph_rwlock_wrlock(h);
+    if (h->hdr->sealed) { sph_rwlock_wrunlock(h); croak("Data::SpatialHash::Shared->clear: spatial hash is frozen (read-only)"); }
     sph_clear_locked(h);
     __atomic_fetch_add(&h->hdr->stat_ops, 1, __ATOMIC_RELAXED);
     sph_rwlock_wrunlock(h);
+
+void
+freeze(self)
+    SV *self
+  PREINIT:
+    EXTRACT(self);
+  CODE:
+    if (h->readonly) croak("Data::SpatialHash::Shared->freeze: cannot freeze a read-only handle");
+    if (sph_freeze(h) != 0) croak("Data::SpatialHash::Shared->freeze: msync: %s", strerror(errno));
+    h->readonly = 1;   /* this handle now rejects mutation too (the file is sealed) */
+
+UV
+frozen(self)
+    SV *self
+  PREINIT:
+    EXTRACT(self);
+  CODE:
+    RETVAL = h->hdr->sealed ? 1 : 0;
+  OUTPUT:
+    RETVAL
+
+UV
+readonly(self)
+    SV *self
+  PREINIT:
+    EXTRACT(self);
+  CODE:
+    RETVAL = h->readonly ? 1 : 0;
+  OUTPUT:
+    RETVAL
 
 SV *stats(self)
     SV *self
   PREINIT:
     EXTRACT(self);
   CODE:
-    sph_rwlock_rdlock(h);
-    uint32_t occ, mx, mxcell; sph_chain_stats(h, &occ, &mx, &mxcell);
-    uint32_t cnt = h->hdr->count, me = h->hdr->max_entries, nb = h->hdr->num_buckets;
-    sph_rwlock_rdunlock(h);
+    uint32_t occ, mx, mxcell, cnt, me, nb;
+    if (h->readonly) {                     /* frozen: immutable, no lock */
+        sph_chain_stats(h, &occ, &mx, &mxcell);
+        cnt = h->hdr->count; me = h->hdr->max_entries; nb = h->hdr->num_buckets;
+    } else {
+        sph_rwlock_rdlock(h);
+        sph_chain_stats(h, &occ, &mx, &mxcell);
+        cnt = h->hdr->count; me = h->hdr->max_entries; nb = h->hdr->num_buckets;
+        sph_rwlock_rdunlock(h);
+    }
     HV *hv = newHV();
     hv_store(hv, "count", 5, newSVuv(cnt), 0);
     hv_store(hv, "max_entries", 11, newSVuv(me), 0);
@@ -1050,5 +1158,7 @@ SV *stats(self)
     hv_store(hv, "load_factor", 11, newSVnv(nb ? (double)cnt / nb : 0), 0);
     hv_store(hv, "ops", 3, newSVuv((UV)__atomic_load_n(&h->hdr->stat_ops, __ATOMIC_RELAXED)), 0);
     hv_store(hv, "mmap_size", 9, newSVuv((UV)h->mmap_size), 0);
+    hv_store(hv, "frozen", 6, newSVuv(h->hdr->sealed ? 1 : 0), 0);
+    hv_store(hv, "readonly", 8, newSVuv(h->readonly ? 1 : 0), 0);
     RETVAL = newRV_noinc((SV *)hv);
   OUTPUT: RETVAL

@@ -44,6 +44,7 @@ t/17-bulk.t
 t/18-geo.t
 t/19-cubesphere.t
 t/20-query-many.t
+t/21-frozen.t
 t/pod_synopsis.t
 t/version_check.t
 xt/asan.t
