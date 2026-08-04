@@ -145,7 +145,7 @@ new(class, path, max_entries, num_buckets, cell_size, ...)
                                           &mode, "Data::SpatialHash::Shared->new");
     SpatialHandle *h = sph_create(p, (uint32_t)max_entries, (uint32_t)num_buckets,
                                   (double)cell_size, worldp, sphere_radius, mode, errbuf);
-    if (!h) croak("Data::SpatialHash::Shared->new: %s", errbuf);
+    if (!h) croak("Data::SpatialHash::Shared->new: %s", errbuf[0] ? errbuf : "out of memory");
     MAKE_OBJ(class, h);
   OUTPUT:
     RETVAL
@@ -168,7 +168,7 @@ new_memfd(class, name, max_entries, num_buckets, cell_size, ...)
                                           NULL, "Data::SpatialHash::Shared->new_memfd");
     SpatialHandle *h = sph_create_memfd(name, (uint32_t)max_entries, (uint32_t)num_buckets,
                                         (double)cell_size, worldp, sphere_radius, errbuf);
-    if (!h) croak("Data::SpatialHash::Shared->new_memfd: %s", errbuf);
+    if (!h) croak("Data::SpatialHash::Shared->new_memfd: %s", errbuf[0] ? errbuf : "out of memory");
     MAKE_OBJ(class, h);
   OUTPUT:
     RETVAL
@@ -181,7 +181,7 @@ new_from_fd(class, fd)
     char errbuf[SPH_ERR_BUFLEN];
   CODE:
     SpatialHandle *h = sph_open_fd(fd, errbuf);
-    if (!h) croak("Data::SpatialHash::Shared->new_from_fd: %s", errbuf);
+    if (!h) croak("Data::SpatialHash::Shared->new_from_fd: %s", errbuf[0] ? errbuf : "out of memory");
     MAKE_OBJ(class, h);
   OUTPUT:
     RETVAL
