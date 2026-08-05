@@ -974,7 +974,6 @@ static SpatialHandle *sph_create(const char *path, uint32_t max_entries,
                         SPH_ERR("%s: fchmod: %s", path, strerror(errno));
                         munmap(base, map_size); flock(fd, LOCK_UN); close(fd); return NULL;
                     }
-                    memset(base, 0, map_size);   /* start from a provably empty structure */
                     sph_init_header(base, max_entries, num_buckets, cell_size, world, sphere_radius, total);
                     flock(fd, LOCK_UN); close(fd);
                     return sph_setup(base, map_size, path, -1);
